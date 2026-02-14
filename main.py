@@ -1,6 +1,5 @@
 import pandas as pd
 import torch
-
 import utlis
 from bandit_algo import User_GNN_Bandit_Per_Arm
 from parameters import get_GNB_parameters
@@ -8,173 +7,145 @@ import argparse
 import numpy as np
 import time
 import signal
-from datetime import datetime
 import sys
-# from User_GNN_packages import *
-
 from multiprocessing import Pool
+from load_data import Market_IM
 
+# --- Global Configuration ---
+Num_Seeds = 1    # Number of unique starting points
+Num_Runs = 1     # Number of episodes/campaigns per seed
+Num_cluster = 10 # Matches the number of lead stocks in Market_IM
+Budget = 50      # Horizon (trading days/steps)
+L = 1            # Number of lead stocks to select per step
+data = 'market'  # Label for the dataset
 
-from load_data import twitter_IM,weibo_IM
-
-
-global Num_Seeds, Num_Runs, Num_cluster, Budget, L, b, data
-
-Num_Seeds = 1  # ->NRUNS
-Num_Runs = 1  # T episode (single campaign or multiple campaign)
-Num_cluster = 50
-Budget = 50  # H hirizon
-L = 1
-data = 'weibo'
-if data == 'twitter':
-    b = twitter_IM(Num_Seeds=Num_Seeds, Budget=Budget, Num_Runs=Num_Runs, Num_cluster=Num_cluster)
-else:
-    b = weibo_IM(Num_Seeds=Num_Seeds, Budget=Budget, Num_Runs=Num_Runs, Num_cluster=Num_cluster)
-
-####################
+# Initialize the Market Environment
+b = Market_IM(Num_Seeds=Num_Seeds, Budget=Budget, Num_Runs=Num_Runs, Num_cluster=Num_cluster)
 
 def train_model(seed):
-    # check gpu status
-    # torch.cuda.set_device(0)
-    # -----------------------------
+    # Device Selection (GPU/CPU)
     if torch.cuda.is_available():
         dev = "cuda:0"
     else:
         dev = "cpu"
     device = torch.device(dev)
-    print("device: ", dev)
-    print("seed: ", seed)
+    print(f"Device: {dev} | Seed: {seed}")
 
-    contexts, campaign = b.generate(seed)
-    influencer_hist_lin = []
-    activations_hist = []  # distinctive act
-    all_activations_hist = []  # all action
+    # Generate Market Contexts and Episodes
+    contexts, episodes = b.generate(seed)
+    activations_hist = []      # Distinct lag-stock responses
+    all_activations_hist = []  # Total responses
 
     for p_i in range(Num_Runs):
-        print("--- Current run: {}/{}".format(p_i + 1, Num_Runs))
-        # load training related parameters
-        parser = get_GNB_parameters(dataset=data)
+        print(f"--- Current Run: {p_i + 1}/{Num_Runs} ---")
+        
+        # Load hyperparameters (Mapping 'market' to a config in parameters.py)
+        # Note: You should add 'market' case to parameters.py similarly to 'weibo'
+        parser = get_GNB_parameters(dataset='weibo') 
         args = parser.parse_args()
 
-        algo_name = 'GNB'
-        model = User_GNN_Bandit_Per_Arm(dim=b.dim, user_n=b.num_user, arm_n=b.n_arm, k=args.k,
-                                        GNN_lr=args.GNN_lr, user_lr=args.user_lr,
-                                        bw_reward=args.bw_reward, bw_conf_b=args.bw_conf_b,
-                                        batch_size=args.batch_size,
-                                        GNN_pooling_step_size=args.GNN_pool_step_size,
-                                        user_pooling_step_size=args.user_pool_step_size,
-                                        arti_explore_constant=args.arti_explore_constant,
-                                        num_layer=-1, explore_param=args.explore_param,
-                                        separate_explore_GNN=args.separate_explore_GNN,
-                                        train_every_user_model=args.train_every_user_model,
-                                        device=device)
-        print(data, algo_name, args.GNN_lr, args.user_lr, args.bw_reward, args.bw_conf_b, args.k,
-              args.batch_size,
-              args.GNN_pool_step_size, args.user_pool_step_size, args.arti_explore_constant,
-              args.train_every_user_model, args.separate_explore_GNN)
-
-        running_time_sum, rec_time_sum = 0.0, 0.0
-        print("Round; Regret; Regret/Round")
-        start_t = time.time()
-
-        # exploration_factor = np.sqrt(np.log(2 * BUDGET * K / delta) / 2)  # for now not yet
+        # Initialize the GNB Model
+        model = User_GNN_Bandit_Per_Arm(
+            dim=b.dim, user_n=b.num_user, arm_n=b.n_arm, k=args.k,
+            GNN_lr=args.GNN_lr, user_lr=args.user_lr,
+            bw_reward=args.bw_reward, bw_conf_b=args.bw_conf_b,
+            batch_size=args.batch_size,
+            GNN_pooling_step_size=args.GNN_pool_step_size,
+            user_pooling_step_size=args.user_pool_step_size,
+            arti_explore_constant=args.arti_explore_constant,
+            num_layer=-1, 
+            explore_param=args.explore_param,
+            separate_explore_GNN=args.separate_explore_GNN,
+            train_every_user_model=args.train_every_user_model,
+            device=device
+        )
 
         prev_activated = set()
 
         for t in range(Budget):
-
+            # 1. Get current market context (e.g., Sentiment/Volatility)
             context = contexts[p_i * Budget + t]
 
-            this_rec_time_s = time.time()
-
-            # Update user graphs
+            # 2. Update Dual-Graphs (Exploitation & Exploration)
             model.update_user_graphs(
-                contexts=np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (10, 1)))),
-                user_i=1)
-            this_g_update_time = time.time()
+                contexts=np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (b.n_arm, 1)))),
+                user_i=1
+            )
 
-            # Recommendation
+            # 3. Model Recommendation (Select Top L Lead Stocks)
             arm_select, point_est, whole_gradients = model.recommend(
-                np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (10, 1)))), t, L)
+                np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (b.n_arm, 1)))), t, L
+            )
 
-            #
-            running_time_sum += (time.time() - this_rec_time_s)
-            rec_time_sum += (time.time() - this_g_update_time)
+            # 4. Observe Market Outcome
+            # We look at the actual lag-stock responses for the selected lead stocks
+            market_episode = episodes[p_i * Budget + t][
+                episodes[p_i * Budget + t].influencer.isin([b.INFLUENCERS[a] for a in arm_select])
+            ]
+            
+            # Remove duplicate lead signals if necessary
+            if len(market_episode) > 0:
+                market_episode = market_episode.groupby('influencer').sample()
 
-            # -------------------------------------------------------------------------------------
-
-            # all_activations = set()
-            #
-            tweet = campaign[p_i * Budget + t][
-                campaign[p_i * Budget + t].influencer.isin([b.INFLUENCERS[a] for a in arm_select])]
-            if len(tweet) > 0:
-                tweet = tweet.groupby('influencer').sample() # remove duplicated
             acts = set()
             acts_grouped = set()
-            for row in tweet.itertuples():
+            for row in market_episode.itertuples():
                 acts.update(row.regular_node_set_unique)
                 acts_grouped.update(row.regular_node_set_grouped)
-            influencer_hist_lin.append(list(tweet.influencer))
 
+            # Calculate Reward (New lag-stocks reacting to signal)
             reward = len(acts - prev_activated)
             distinct_acts = acts - prev_activated
-            distinct_acts_goruped = set([b.mapping_dict[i] for i in distinct_acts])
-            reward2 = len(acts)
+            distinct_acts_grouped = set([b.mapping_dict[i] for i in distinct_acts])
+            
             prev_activated.update(acts)
             activations_hist.append(reward)
-            all_activations_hist.append(reward2)
+            all_activations_hist.append(len(acts))
 
-            # -------------------------------------------------------------------------------------
-            # update model
+            # 5. Update Models based on Reward Feedback
             for arm in arm_select:
-                # Update model when made false prediction ---------------------------------------------------------
                 if reward == 0:
+                    # Case: Signal failed to produce a lag response
                     for u in np.arange(b.num_user):
-                        # Create additional samples for exploration network -----------------------------
-                        # Add artificial exploration info when made false predictions
                         if args.arti_explore_constant > 0:
                             model.update_artificial_explore_info(t, u, arm, whole_gradients)
-                        model.update_info(u_selected=u, a_selected=arm, contexts=np.hstack(
-                            (b.influencer_emb, np.tile(context.reshape(1, -1), (10, 1)))), reward=0,
-                                          GNN_gradient=whole_gradients[arm],
-                                          GNN_residual_reward=-point_est[arm][u])
-                # Update model when made right prediction ---------------------------------------------------------
+                        model.update_info(
+                            u_selected=u, a_selected=arm, 
+                            contexts=np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (b.n_arm, 1)))), 
+                            reward=0,
+                            GNN_gradient=whole_gradients[arm],
+                            GNN_residual_reward=-point_est[arm][u]
+                        )
                 else:
-                    for u in distinct_acts_goruped:
-                        GNN_residual_reward = 1 / len(arm_select) - point_est[arm][u]
-                        model.update_info(u_selected=u, a_selected=arm, contexts=np.hstack(
-                            (b.influencer_emb, np.tile(context.reshape(1, -1), (10, 1)))),
-                                          reward=1 / len(arm_select),
-                                          GNN_gradient=whole_gradients[arm],
-                                          GNN_residual_reward=GNN_residual_reward)
+                    # Case: Successful Lead-Lag signal identification
+                    for u in distinct_acts_grouped:
+                        GNN_residual_reward = (1 / len(arm_select)) - point_est[arm][u]
+                        model.update_info(
+                            u_selected=u, a_selected=arm, 
+                            contexts=np.hstack((b.influencer_emb, np.tile(context.reshape(1, -1), (b.n_arm, 1)))),
+                            reward=1 / len(arm_select),
+                            GNN_gradient=whole_gradients[arm],
+                            GNN_residual_reward=GNN_residual_reward
+                        )
 
-            # for each spread campaign
+            # 6. Periodic Model Training
             u_exploit_loss, u_explore_loss = model.train_user_models(u=acts_grouped)
             GNN_exploit_loss, GNN_explore_loss = model.train_GNN_models()
-            print("Loss: ", u_exploit_loss, u_explore_loss, GNN_exploit_loss, GNN_explore_loss)
+            print(f"Step {t} Loss | User: {u_exploit_loss:.4f}, {u_explore_loss:.4f} | GNN: {np.mean(GNN_exploit_loss):.4f}")
 
+    # Save Results
     reward_df = utlis.orgniaze_reward(activations_hist, all_activations_hist, seed, Budget, p_i)
-    reward_df.to_csv(str(data)+"_gnb_L" + str(L) + "_" + str(Num_cluster) + "_" + str(Num_Seeds) + "seeds_" + str(Num_Runs) + "T" + \
-                     str(Budget) + "H_new1" + ".csv", mode="a", sep=";", index=False, header=False)
-    # rewards_df = rewards_df.append(reward_df)
+    output_file = f"{data}_GNB_Results_Seed{seed}.csv"
+    reward_df.to_csv(output_file, sep=";", index=False)
+    print(f"Results saved to {output_file}")
 
 def init_worker():
-    ''' Add KeyboardInterrupt exception to mutliprocessing workers '''
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-
 if __name__ == '__main__':
-
     number_workers = 1
-    seeds_list = b.seeds
-
+    seeds_list = list(b.seeds.keys())
     arg_list = [(seed,) for seed in seeds_list]
 
     with Pool(number_workers) as p:
-        p.starmap(train_model, arg_list[:12])
-
-
-
-
-
-
+        p.starmap(train_model, arg_list)
